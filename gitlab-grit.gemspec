@@ -14,8 +14,7 @@ Gem::Specification.new do |s|
   s.files = `git ls-files lib/`.split("\n")
   s.test_files = s.files.select { |path| path =~ /^test\/test_.*\.rb/ }
 
-  s.add_dependency("charlock_holmes", "~> 0.6.9")
-  s.add_dependency('posix-spawn', "~> 0.3.6")
+  s.add_dependency("charlock_holmes-jruby", "~> 0.1.2")
   s.add_dependency('mime-types', "~> 1.15")
   s.add_dependency('diff-lcs', "~> 1.1")
   s.add_development_dependency('mocha')
