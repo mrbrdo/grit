@@ -49,7 +49,6 @@ class TestGit < Test::Unit::TestCase
   end
 
   def test_raises_if_too_many_bytes
-    fail if jruby?
     assert_raises Grit::Git::GitTimeout do
       @git.sh "yes | head -#{Grit::Git.git_max_size + 1}"
     end

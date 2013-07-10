@@ -23,7 +23,7 @@ class TestEncoding < Test::Unit::TestCase
 
   def test_encode_string
     message = GritExt.encode!("{foo \xC3 'bar'}")
-    assert_equal message, "{foo Ã 'bar'}"
+    assert_equal message, "{foo Ã 'bar'}".force_encoding('UTF-8')
     assert_equal message.encoding.name, "UTF-8"
 
     message = "我爱你".encode("GBK")

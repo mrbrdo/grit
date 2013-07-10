@@ -1,5 +1,5 @@
 require 'tempfile'
-require 'posix-spawn'
+require 'posix_spawn_compat'
 module Grit
 
   class Git
