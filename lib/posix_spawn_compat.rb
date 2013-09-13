@@ -597,6 +597,7 @@ module POSIX
       def exec!
         # spawn the process and hook up the pipes
         @argv[0] = @argv[0][0] if @argv[0].is_a? Array # TODO
+        # :chdir   => chdir, TODO
         @out = ''
         @err = ''
 
