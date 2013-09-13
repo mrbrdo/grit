@@ -659,7 +659,7 @@ module POSIX
         pid = io.pid
         IO.select([], [io], [], 1)
         io.write(@input) if @input && @input.size > 0
-        io.close_write
+        io.close_write rescue nil
         begin
           while !@max || @out.size <= @max
             IO.select([io], nil, nil, @timeout)
