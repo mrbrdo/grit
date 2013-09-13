@@ -657,6 +657,7 @@ module POSIX
       #   exceeds the amount specified by the max argument.
       def read_and_write(io)
         pid = io.pid
+        IO.select([], [io], [], 1)
         io.write(@input) if @input && @input.size > 0
         io.close_write
         begin
