@@ -1,8 +1,121 @@
+require 'java'
+require 'stringio'
+
 class IO
     alias :posix_fileno :fileno
 end
 
 module POSIX
+  module Spawn
+    class ProcessBuilderWrapper
+      class Status
+        def initialize(status)
+          @status = status
+        end
+
+        def success?
+          @status == 0
+        end
+
+        def to_i
+          @status
+        end
+      end
+
+      def initialize(*args)
+        @pb = java.lang.ProcessBuilder.new(java.util.ArrayList.new(args))
+        @pb.redirectErrorStream(false)
+      end
+
+      def directory
+        @pb.directory().path
+      end
+
+      def directory=(value)
+        @pb.directory(java.io.File.new(value))
+      end
+
+      def environment
+        @pb.environment
+      end
+
+      def start
+        process = @pb.start
+        connectOutputStream(process.getOutputStream) do |sin|
+          connectInputStream(process.getInputStream) do |sout|
+            connectInputStream(process.getErrorStream) do |serr|
+              yield(process, sin, sout, serr)
+            end
+          end
+        end
+      end
+
+      def run(options = {})
+        @error = options[:error]
+        @input = options[:input]
+        @output = options[:output]
+        start do |process, sin, sout, serr|
+          writeInput(sin)
+          process.waitFor.tap do
+            readOutput(sout, serr)
+            @output.flush
+            @error.flush
+          end
+        end
+      end
+
+    private
+      def connectInputStream(stream)
+        is = java.io.InputStreamReader.new(stream)
+        br = java.io.BufferedReader.new(is)
+        yield(br).tap { br.close }
+      end
+
+      def connectOutputStream(stream)
+        ow = java.io.OutputStreamWriter.new(stream)
+        bw = java.io.BufferedWriter.new(ow)
+        yield(bw).tap { bw.close }
+      end
+
+      def writeInput(sin)
+        written = 0
+        if @input && @input.size > 0
+          sin.write(@input)
+          sin.flush
+        end
+        written
+      rescue java.io.IOException
+        written
+      end
+
+      def readOutput(sout, serr)
+        read = 0
+        buf = Java::char[1024].new
+        while (oline = readJavaStream(sout, buf, 1024)) || (eline = readJavaStream(serr, buf, 1024))
+          if oline
+            @output.write(oline)
+            read += oline.size
+          else
+            @error.write(eline)
+            read += eline.size
+          end
+        end
+        read
+      end
+
+      def readJavaStream(stream, buffer, buffer_size)
+        if (size = stream.read(buffer, 0, buffer_size)) > 0
+          javaCharToString(buffer, size)
+        else
+          nil
+        end
+      end
+
+      def javaCharToString(array, length)
+        java.lang.String.new(array, 0, length).to_s
+      end
+    end
+  end
   # The POSIX::Spawn module implements a compatible subset of Ruby 1.9's
   # Process::spawn and related methods using the IEEE Std 1003.1 posix_spawn(2)
   # system interfaces where available, or a pure Ruby fork/exec based
@@ -344,7 +457,7 @@ module POSIX
       env.merge!(options.delete(:env)) if options.key?(:env)
 
       # remaining arguments are the argv supporting a number of variations.
-      argv = adjust_process_spawn_argv(args)
+      argv = adjust_process_spawn_argv_jruby(args)
 
       [env, argv, options]
     end
@@ -471,19 +584,18 @@ module POSIX
     #
     # The args array may follow any of these variations:
     #
-    # 'true'                     => [['true', 'true']]
-    # 'echo', 'hello', 'world'   => [['echo', 'echo'], 'hello', 'world']
-    # 'echo hello world'         => [['/bin/sh', '/bin/sh'], '-c', 'echo hello world']
-    # ['echo', 'fuuu'], 'hello'  => [['echo', 'fuuu'], 'hello']
+    # 'true'                     => ['true']
+    # 'echo', 'hello', 'world'   => ['echo', 'hello', 'world']
+    # 'echo hello world'         => ['/bin/sh', '-c', 'echo hello world']
+    # ['echo', 'fuuu'], 'hello'  => ['fuuu', 'hello']
     #
     # Returns a [[cmdname, argv0], argv1, ...] array.
-    def adjust_process_spawn_argv(args)
+    def adjust_process_spawn_argv_jruby(args)
       if args.size == 1 && args[0] =~ /[ |>]/
         # single string with these characters means run it through the shell
-        [['/bin/sh', '/bin/sh'], '-c', args[0]]
-      elsif !args[0].respond_to?(:to_ary)
-        # [argv0, argv1, ...]
-        [[args[0], args[0]], *args[1..-1]]
+        ['/bin/sh', '-c', args[0]]
+      elsif args[0].kind_of?(Array)
+        [args[0][0], *args[1..-1]]
       else
         # [[cmdname, argv0], argv1, ...]
         args
@@ -595,44 +707,17 @@ module POSIX
       # Execute command, write input, and read output. This is called
       # immediately when a new instance of this object is initialized.
       def exec!
-        # spawn the process and hook up the pipes
-        @argv[0] = @argv[0][0] if @argv[0].is_a? Array # TODO
-        # :chdir   => chdir, TODO
-        @out = ''
-        @err = ''
-
-        raise "Options #{@options.keys.join(',')} not supported." if @options && !@options.empty?
-
-        if @timeout
+        pbw = POSIX::Spawn::ProcessBuilderWrapper.new(*@argv)
+        @env.each_pair { |k, v| pbw.environment.put(k.to_s, v.to_s) } if @env
+        pbw.directory = @options[:chdir].to_s if @options[:chdir]
+        pbw.start do |process, stdin, stdout, stderr|
           begin
-            ::Timeout.timeout(@timeout) do
-              exec_popen!
-            end
-          rescue Timeout::Error
-            raise TimeoutExceeded
+            @out, @err, status = read_and_write(process, @input, stdin,
+              stdout, stderr, @timeout, @max)
+            @status = POSIX::Spawn::ProcessBuilderWrapper::Status.new(status)
+          ensure
+            [stdin, stdout, stderr].each { |fd| fd.close rescue nil }
           end
-        else
-          exec_popen!
-        end
-
-        @status = $?
-      end
-
-      def exec_popen!
-        error_file = Tempfile.open('err')
-        error_file.close
-        cmd_file = Tempfile.open('cmd')
-        cmd_file.write(@argv.shift + ' "$@"' + " 2> #{error_file.path}")
-        cmd_file.close
-
-        ::IO.popen([@env, 'sh', cmd_file.path] + @argv, "r+") do |io|
-          read_and_write(io)
-        end
-      ensure
-        cmd_file.unlink if cmd_file
-        if error_file
-          @err = File.read(error_file.path)
-          error_file.unlink
         end
       end
 
@@ -655,37 +740,125 @@ module POSIX
       #   the duration specified in the timeout argument.
       # Raises MaximumOutputExceeded when the total number of bytes output
       #   exceeds the amount specified by the max argument.
-      def read_and_write(io)
-        pid = io.pid
-        IO.select([], [io], [], 1)
-        io.write(@input) if @input && @input.size > 0
-        io.close_write rescue nil
-        begin
-          while !@max || @out.size <= @max
-            IO.select([io], nil, nil, @timeout)
-            @out += io.readpartial(BUFSIZE) || ''
-          end
-        rescue StandardError
+      def read_and_write(process, input, stdin, stdout, stderr, timeout=nil, max=nil)
+        max = nil if max && max <= 0
+        out, err = '', ''
+        offset = 0
+
+        # force all string and IO encodings to BINARY under 1.9 for now
+        if out.respond_to?(:force_encoding) and stdin.respond_to?(:set_encoding)
+          out.force_encoding('BINARY')
+          err.force_encoding('BINARY')
+          input = input.dup.force_encoding('BINARY') if input
         end
 
-        raise MaximumOutputExceeded if @max && @out.size > @max
-        sleep 0.1 while pid_running?(pid)
-      ensure
-        ::Process.kill('KILL', pid) rescue nil
+        timeout = nil if timeout && timeout <= 0.0
+        @runtime = 0.0
+        start = Time.now
+
+        readers = [stdout, stderr]
+        writers =
+          if input
+            [stdin]
+          else
+            stdin.close rescue nil
+            []
+          end
+        Timeout::timeout(timeout * 1.5) do
+          #ready = IO.select(readers, writers, readers + writers, t)
+          #raise TimeoutExceeded if ready.nil?
+
+          # write to stdin stream
+          writeInput(stdin, input)
+          stdin.close rescue nil
+
+          status = process.waitFor # TODO
+
+          # read from stdout and stderr streams
+          partial_out, partial_err, n_read = readOutput(stdout, stderr)
+          out << partial_out if partial_out
+          err << partial_err if partial_err
+
+          # keep tabs on the total amount of time we've spent here
+          @runtime = Time.now - start
+          if timeout
+            t = timeout - @runtime
+            raise TimeoutExceeded if t < 0.0
+          end
+
+          # maybe we've hit our max output
+          if max && (out.size + err.size) > max
+            raise MaximumOutputExceeded
+          end
+
+          [out, err, status]
+        end
+      rescue Timeout::Error
+        TimeoutExceeded
       end
 
-      def pid_running?(pid)
-        ::Process.kill(0, pid) == 0
-      rescue StandardError
-        false
+      def writeInput(sin, input)
+        written = 0
+        if input && input.size > 0
+          sin.write(input)
+          sin.flush
+        end
+        written
+      rescue java.io.IOException
+        written
       end
 
-      # Wait for the child process to exit
+      def readOutput(sout, serr)
+        out = nil
+        err = nil
+        read = 0
+        buf = Java::char[1024].new
+        while (oline = readJavaStream(sout, buf, 1024)) || (eline = readJavaStream(serr, buf, 1024))
+          if oline
+            out = oline
+            read += oline.size
+          else
+            err = eline
+            read += eline.size
+          end
+        end
+        [out, err, read]
+      end
+
+      def readJavaStream(stream, buffer, buffer_size)
+        if (size = stream.read(buffer, 0, buffer_size)) > 0
+          javaCharToString(buffer, size)
+        else
+          nil
+        end
+      end
+
+      def javaCharToString(array, length)
+        java.lang.String.new(array, 0, length).to_s
+      end
+      # Converts the various supported command argument variations into a
+      # standard argv suitable for use with exec. This includes detecting commands
+      # to be run through the shell (single argument strings with spaces).
       #
-      # Returns the Process::Status object obtained by reaping the process.
-      def waitpid(pid)
-        ::Process::waitpid(pid)
-        $?
+      # The args array may follow any of these variations:
+      #
+      # 'true'                     => [['true', 'true']]
+      # 'echo', 'hello', 'world'   => [['echo', 'echo'], 'hello', 'world']
+      # 'echo hello world'         => [['/bin/sh', '/bin/sh'], '-c', 'echo hello world']
+      # ['echo', 'fuuu'], 'hello'  => [['echo', 'fuuu'], 'hello']
+      #
+      # Returns a [[cmdname, argv0], argv1, ...] array.
+      def adjust_process_spawn_argv(args)
+        if args.size == 1 && args[0] =~ /[ |>]/
+          # single string with these characters means run it through the shell
+          [['/bin/sh', '/bin/sh'], '-c', args[0]]
+        elsif !args[0].respond_to?(:to_ary)
+          # [argv0, argv1, ...]
+          [[args[0], args[0]], *args[1..-1]]
+        else
+          # [[cmdname, argv0], argv1, ...]
+          args
+        end
       end
     end
   end
